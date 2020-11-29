@@ -9,13 +9,7 @@
 #include <stddef.h>
 #include "tss2_tpm2_types.h"
 #include "tss2-sys/sysapi_util.h"
-#if defined(OSSL)
 #include "esys_crypto_ossl.h"
-#elif defined(MBED)
-#include "esys_crypto_mbed.h"
-#else
-#error "No crypto backend defined"
-#endif
 
 #ifdef __cplusplus
 extern "C" {

@@ -283,7 +283,7 @@ static TSS2_RC spi_tpm_wait_for_status(TSS2_TCTI_SPI_CONTEXT* ctx, uint32_t stat
         }
         // Delay next poll by 8ms to avoid spamming the TPM
         spi_tpm_delay_ms(ctx, 8);
-    } while (blocking || spi_tpm_timeout_expired(ctx));
+    } while (blocking || !spi_tpm_timeout_expired(ctx));
 
     // Timed out
     return TSS2_TCTI_RC_TRY_AGAIN;

@@ -417,6 +417,30 @@ src_tss2_tcti_libtss2_tcti_spi_la_SOURCES  = \
     src/tss2-tcti/tcti-common.c \
     src/tss2-tcti/tcti-spi.c \
     src/tss2-tcti/tcti-spi.h
+
+if ENABLE_TCTI_SPI_USB
+libtss2_tcti_spi_usb = src/tss2-tcti/libtss2-tcti-spi-usb.la
+tss2_HEADERS += $(srcdir)/include/tss2/tss2_tcti_spi_usb.h
+lib_LTLIBRARIES += $(libtss2_tcti_spi_usb)
+pkgconfig_DATA += lib/tss2-tcti-spi-usb.pc
+EXTRA_DIST += lib/tss2-tcti-spi-usb.map \
+              lib/tss2-tcti-spi-usb.def
+
+src_tss2_tcti_libtss2_tcti_spi_usb_la_LDFLAGS  = -lusb-1.0
+if HAVE_LD_VERSION_SCRIPT
+if !UNIT
+src_tss2_tcti_libtss2_tcti_spi_usb_la_LDFLAGS  += -Wl,--version-script=$(srcdir)/lib/tss2-tcti-spi-usb.map
+endif # UNIT
+endif # HAVE_LD_VERSION_SCRIPT
+src_tss2_tcti_libtss2_tcti_spi_usb_la_LIBADD   = $(libutil) $(libtss2_mu) $(libtss2_tcti_spi)
+src_tss2_tcti_libtss2_tcti_spi_usb_la_SOURCES  = \
+    src/tss2-tcti/tcti-common.c \
+    src/tss2-tcti/tcti-spi-usb.c \
+    src/tss2-tcti/tcti-spi-usb.h \
+    src/tss2-tcti/tcti-spi.h
+
+
+endif # ENABLE_TCTI_SPI_USB
 endif # ENABLE_TCTI_spi
 
 ### TCG TSS SYS spec library ###

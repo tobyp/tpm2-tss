@@ -2,3 +2,6 @@ LIBRARY tss2-tcti-spi
 EXPORTS
     Tss2_Tcti_Info
     Tss2_Tcti_Spi_Init
+    tcti_spi_receive
+    tcti_spi_transmit
+    tcti_spi_finalize

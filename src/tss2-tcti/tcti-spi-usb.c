@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /*
- * Copyright 2020 Fraunhofer SIT. All rights reserved.
+ * Copyright 2020 Peter Huewe
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -16,12 +16,372 @@
 
 #include "tss2_tcti.h"
 #include "tss2_tcti_spi.h"
+#include "tss2_tcti_spi_usb.h"
 #include "tss2_mu.h"
 #include "tcti-common.h"
 #include "tcti-spi.h"
+#include "tcti-spi-usb.h"
 #include "util/io.h"
 #define LOGMODULE tcti
 #include "util/log.h"
+
+
+//------------------------------------------------------------------------------
+#include <stdio.h>
+#include <libusb-1.0/libusb.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#define VID_CYPRESS 0x04b4u
+#define PID_CYUSBSPI 0x0004u
+#define TIMEOUT 1000
+#define CTRL_SET 0xC0u
+#define CTRL_GET 0x40u
+#define CY_CMD_SPI 0xCAu
+#define CY_CMD_GPIO_SET 0xDBu
+#define CY_SPI_WRITEREAD 0x03u
+#define EP_OUT 0x01u
+#define EP_IN 0x82u
+
+#define SPI_MAX_TRANSFER (64+4)
+
+//static const uint8_t read_access[]= {0x80, 0xD4, 0x00, 0x00, 0x00};
+//static const uint8_t assert_locality[]= {0x00, 0xD4, 0x00, 0x00, 0x02};
+
+#define DEBUG 0
+
+void posix_usleep(uint32_t us){
+
+
+struct timeval ts = {us/1000000, us%1000000};
+select (0,NULL,NULL, NULL, &ts);
+
+}
+
+
+void hexdump (char *desc, const uint8_t *buf, size_t len){
+#if DEBUG
+    printf("%s:\t", desc);
+    for (size_t i = 0; i <len; i++){
+        printf("%02x ", buf[i]);
+        if(i!= 0 && i%16==0)
+            printf("\n\t");
+    }
+    printf("\n");
+#else
+(void) desc;
+(void) buf;
+(void) len;
+#endif
+
+}
+
+
+int tpm_reset(libusb_device_handle *dev_handle){
+    int ret;
+    ret = libusb_control_transfer(dev_handle, CTRL_SET, CY_CMD_GPIO_SET, 8, 0, NULL, 0, TIMEOUT);
+    if (ret) {
+        fprintf(stderr, "preparing SPI FAILED\n");
+        goto out;
+    }
+
+       struct timespec {
+               time_t tv_sec;        /* seconds */
+               long   tv_nsec;       /* nanoseconds */
+           };
+
+posix_usleep(30*1000);
+    ret = libusb_control_transfer(dev_handle, CTRL_SET, CY_CMD_GPIO_SET, 8, 1, NULL, 0, TIMEOUT);
+    if (ret) {
+        fprintf(stderr, "preparing SPI FAILED\n");
+        goto out;
+    }
+posix_usleep(30*1000);
+out:
+    return ret;
+
+
+
+}
+
+
+TSS2_RC platform_spi_acquire (void* user_data)
+{
+    // Cast our user data
+    PLATFORM_USERDATA* platform_data = (PLATFORM_USERDATA*) user_data;
+    TSS2_RC ret;
+    ret = libusb_control_transfer(platform_data->dev_handle, CTRL_SET, CY_CMD_GPIO_SET, 1, 0, NULL, 0, TIMEOUT);
+    if (ret) {
+        //fprintf(stderr, "preparing SPI FAILED\n");
+        goto out;
+    }
+out:
+    return 0;
+
+
+}
+
+TSS2_RC platform_spi_release (void* user_data)
+{
+    // Cast our user data
+    TSS2_RC ret;
+    PLATFORM_USERDATA* platform_data = (PLATFORM_USERDATA*) user_data;
+    ret = libusb_control_transfer(platform_data->dev_handle, CTRL_SET, CY_CMD_GPIO_SET, 1, 1, NULL, 0, TIMEOUT);
+    if (ret) {
+       // fprintf(stderr, "preparing SPI FAILED\n");
+        goto out;
+    }
+out:
+    // Release CS and release the bus for other devices
+    return 0;
+}
+
+TSS2_RC platform_spi_transfer (void* user_data, const void *data_out, void *data_in, size_t cnt)
+{
+    // Cast our user data
+    PLATFORM_USERDATA* platform_data = (PLATFORM_USERDATA*) user_data;
+
+    // Maximum transfer size is 64 byte because we don't use DMA (and the TPM doesn't support more anyway)
+    if (cnt > 64+4) {
+        return TSS2_TCTI_RC_BAD_VALUE;
+    }
+
+    // At least one of the buffers has to be set
+    if (data_out == NULL && data_in == NULL) {
+        return TSS2_TCTI_RC_BAD_VALUE;
+    }
+
+    // Clear receive buffer
+    if (data_in != NULL && data_in !=  data_out) {
+        memset(data_in, 0, cnt);
+    }
+
+
+    size_t length = cnt;
+    uint8_t *spi_dma_buffer = platform_data->spi_dma_buffer;
+    libusb_device_handle *dev_handle = platform_data->dev_handle;
+    memset(spi_dma_buffer, 0, SPI_MAX_TRANSFER);
+
+    int act_len = 0;
+    int retry = 0;
+
+    size_t transfered = 0;
+    int ret = 0;
+    if (data_out != NULL){
+
+    memcpy(spi_dma_buffer, data_out, length);
+    hexdump("OUT", data_out, length);
+    }
+    ret = libusb_control_transfer(dev_handle, CTRL_SET, CY_CMD_SPI, CY_SPI_WRITEREAD, length, NULL, 0, TIMEOUT);
+    if (ret) {
+        fprintf(stderr, "preparing SPI FAILED\n");
+        goto out;
+    }
+    while (transfered != length){
+        ret = libusb_bulk_transfer(dev_handle, EP_OUT, spi_dma_buffer+transfered, length, &act_len, TIMEOUT);
+        if (ret) {
+            fprintf(stderr, "WRITING SPI FAILED %d %s\n",ret, libusb_strerror(ret));
+            goto out;
+        }
+        transfered += act_len;
+
+        if (transfered != length) {
+	#if DEBUG > 2
+            fprintf(stderr, "not all bytes written %zd %d < %zd\n", transfered, act_len, length);
+	#endif
+        }
+
+    }
+
+
+posix_usleep(30*1000);
+
+    transfered = 0 ;
+   retry = 0 ; 
+    while(transfered != length){
+        ret = libusb_bulk_transfer(dev_handle, EP_IN, spi_dma_buffer+transfered, length, &act_len, TIMEOUT);
+        if (ret) {
+            fprintf(stderr, "READ SPI FAILED %d  %s\n", ret, libusb_strerror(ret));
+	    if (retry++ > 5)
+            	goto out;
+	    continue;
+
+        }
+        transfered += act_len;
+        if (transfered != length) {
+	#if DEBUG  > 2
+            fprintf(stderr, "INFO: not all bytes read %zd %d < %zd\n", transfered, act_len, length);
+	    #endif
+        }
+    }
+if (data_in != NULL) {
+    memcpy(data_in, spi_dma_buffer, length);
+    hexdump("IN", data_in, length);
+    }
+	#if DEBUG  > 2
+    printf("done\n");
+    #endif
+out:
+    memset(spi_dma_buffer, 0, SPI_MAX_TRANSFER);
+    return ret;
+
+
+
+
+}
+
+void platform_sleep_ms (void* user_data, int32_t milliseconds)
+{
+(void ) user_data;
+  posix_usleep(milliseconds*1000);
+}
+
+void platform_start_timeout (void* user_data, int32_t milliseconds)
+{
+    // Cast our user data
+    PLATFORM_USERDATA* platform_data = (PLATFORM_USERDATA*) user_data;
+    struct timeval t1;
+//    struct timeval t2 = {0, milliseconds*1000};
+    
+    gettimeofday(&t1, NULL);
+
+
+platform_data->timeout_expiry.tv_sec=milliseconds/1000;
+platform_data->timeout_expiry.tv_usec=milliseconds*1000;
+    //timeradd(&t1,&t2, &platform_data->timeout_expiry);
+}
+
+bool platform_timeout_expired (void* user_data)
+{
+    // Cast our user data
+    PLATFORM_USERDATA* platform_data = (PLATFORM_USERDATA*) user_data;
+    struct timeval t1;
+    gettimeofday(&t1, NULL);
+    int res =0; //=  timercmp(&t1,&platform_data->timeout_expiry, >);
+
+    printf("t1: %ld.%ld exp %ld.%ld %d\n", t1.tv_sec, t1.tv_usec,platform_data->timeout_expiry.tv_sec, platform_data->timeout_expiry.tv_usec, res);
+
+
+    // Check if timeout already expired
+    return res;
+}
+
+void platform_finalize(void* user_data)
+{
+    // Cast our user data
+    PLATFORM_USERDATA* platform_data = (PLATFORM_USERDATA*) user_data;
+
+    // Free resources inside user_data like SPI device handles here
+    // ...
+    
+    // Free user_data
+    free(platform_data);
+}
+
+TSS2_TCTI_SPI_PLATFORM create_tcti_spi_platform()
+{
+    TSS2_TCTI_SPI_PLATFORM platform= {};
+    // Create required platform user data
+    PLATFORM_USERDATA* platform_data = malloc(sizeof(PLATFORM_USERDATA));
+    memset(platform_data, 0, sizeof(*platform_data));
+    gettimeofday(&platform_data->timeout_expiry, NULL);
+
+
+    int ret=0;
+    platform_data->dev_handle = NULL;
+    platform_data->ctx = NULL;
+    ret = libusb_init(&platform_data->ctx);
+    if (ret) {
+        fprintf(stderr, "libusb init failed\n");
+        goto out;
+    }
+    platform_data->dev_handle = libusb_open_device_with_vid_pid(platform_data->ctx, VID_CYPRESS, PID_CYUSBSPI); 
+    if (!platform_data->dev_handle) {
+        fprintf(stderr, "LetsTrust-TPM2Go not found \n");
+        goto out;
+    }
+
+    platform_data->spi_dma_buffer = libusb_dev_mem_alloc(platform_data->dev_handle, SPI_MAX_TRANSFER);
+    if (!platform_data->spi_dma_buffer){
+
+        fprintf(stderr, "failed to allocate memory\n");
+        goto out;
+    }
+
+#if 0
+    tpm_reset(platform_data->dev_handle);
+    uint8_t readbuf [64] ;
+    memset(readbuf, 0xAA, 64);
+
+    printf("Read Access Register:");
+    ret = platform_spi_transfer(platform_data, read_access, readbuf, sizeof(read_access));
+    if(ret){
+        fprintf(stderr, "spi_transfer failed\n");
+    }
+    printf("%02x\n", readbuf[4]);
+
+    printf("Assert locality \n");
+    ret = platform_spi_transfer(platform_data, assert_locality, readbuf, sizeof(read_access));
+    if(ret){
+        fprintf(stderr, "spi_transfer failed\n");
+    }
+
+
+    memset(readbuf, 0xAA, 64);
+    printf("Read Access Register again:");
+    ret = platform_spi_transfer(platform_data, read_access, readbuf, sizeof(read_access));
+    if(ret){
+        fprintf(stderr, "spi_transfer failed\n");
+    }
+    printf("%02x", readbuf[4]);
+
+
+    tpm_reset(platform_data->dev_handle);
+
+
+#endif
+
+    
+    // Create TCTI SPI platform struct with custom platform methods
+    platform.user_data = platform_data;
+    platform.sleep_ms = platform_sleep_ms;
+    platform.start_timeout = platform_start_timeout;
+    platform.timeout_expired = platform_timeout_expired;
+    platform.spi_acquire = platform_spi_acquire;
+    platform.spi_release = platform_spi_release;
+    platform.spi_transfer = platform_spi_transfer;
+    platform.finalize = platform_finalize;
+
+    printf("PLATFORM REG DONE\n--------------------\n");
+    
+    return platform;
+out:
+    if (platform_data->spi_dma_buffer)
+        libusb_dev_mem_free(platform_data->dev_handle, platform_data->spi_dma_buffer, SPI_MAX_TRANSFER);
+
+
+    if(platform_data->dev_handle)
+        libusb_close(platform_data->dev_handle); //close the device we opened
+    if (platform_data->ctx)
+        libusb_exit(platform_data->ctx); //needs to be called to end the
+
+ return platform;
+
+}
+
+
+
+
+
+
+
+
+
+
+//------------------------------------------------------------------------------
+
+#if 0
 
 static inline void spi_tpm_delay_ms(TSS2_TCTI_SPI_CONTEXT* ctx, int milliseconds)
 {
@@ -228,7 +588,8 @@ static uint32_t spi_tpm_get_burst_count(TSS2_TCTI_SPI_CONTEXT* ctx)
     uint32_t status = spi_tpm_read_sts_reg(ctx);
     return (status & TCTI_SPI_TPM_STS_BURST_COUNT_MASK) >> TCTI_SPI_TPM_STS_BURST_COUNT_SHIFT;
 }
-
+#endif
+#if 0
 static uint8_t spi_tpm_read_access_reg(TSS2_TCTI_SPI_CONTEXT* ctx)
 {
     uint8_t access = 0;
@@ -242,7 +603,8 @@ static void spi_tpm_write_access_reg(TSS2_TCTI_SPI_CONTEXT* ctx, uint8_t access_
     assert (!(access_bit & (access_bit - 1)));
     spi_tpm_write_reg(ctx, TCTI_SPI_TPM_ACCESS_REG, &access_bit, sizeof(access_bit));
 }
-
+#endif
+#if 0
 static TSS2_RC spi_tpm_claim_locality(TSS2_TCTI_SPI_CONTEXT* ctx)
 {
     uint8_t access;
@@ -250,8 +612,8 @@ static TSS2_RC spi_tpm_claim_locality(TSS2_TCTI_SPI_CONTEXT* ctx)
     
     // Check if locality 0 is busy
     if (access & TCTI_SPI_TPM_ACCESS_ACTIVE_LOCALITY) {
-        LOG_TRACE("Locality 0 is already active, status: %#x", access);
-        return TSS2_RC_SUCCESS;
+        LOG_ERROR("Locality 0 is busy, status: %#x", access);
+        return TSS2_TCTI_RC_IO_ERROR;
     }
 
     // Request locality 0
@@ -265,7 +627,6 @@ static TSS2_RC spi_tpm_claim_locality(TSS2_TCTI_SPI_CONTEXT* ctx)
     LOG_ERROR("Failed to claim locality 0, status: %#x", access);
     return TSS2_TCTI_RC_IO_ERROR;
 }
-
 static TSS2_RC spi_tpm_wait_for_status(TSS2_TCTI_SPI_CONTEXT* ctx, uint32_t status_mask, uint32_t status_expected, int32_t timeout)
 {
     uint32_t status;
@@ -332,9 +693,10 @@ static void spi_tpm_fifo_transfer(TSS2_TCTI_SPI_CONTEXT* ctx, uint8_t* transfer_
  */
 TSS2_TCTI_SPI_CONTEXT* tcti_spi_context_cast (TSS2_TCTI_CONTEXT *tcti_ctx)
 {
-    if (tcti_ctx != NULL && TSS2_TCTI_MAGIC (tcti_ctx) == TCTI_SPI_MAGIC) {
+    if (tcti_ctx != NULL && TSS2_TCTI_MAGIC (tcti_ctx) == TCTI_SPI_USB_MAGIC) {
         return (TSS2_TCTI_SPI_CONTEXT*)tcti_ctx;
     }
+LOG_ERROR("context cast failed");
     return NULL;
 }
 
@@ -360,8 +722,9 @@ TSS2_RC tcti_spi_receive (TSS2_TCTI_CONTEXT* tcti_context, size_t *response_size
         return TSS2_TCTI_RC_BAD_CONTEXT;
     }
     
-    rc = tcti_common_receive_checks (tcti_common, response_size, TCTI_SPI_MAGIC);
+    rc = tcti_common_receive_checks (tcti_common, response_size, TCTI_SPI_USB_MAGIC);
     if (rc != TSS2_RC_SUCCESS) {
+LOG_ERROR("common checks failed");
         return rc;
     }
 
@@ -474,8 +837,9 @@ TSS2_RC tcti_spi_transmit (TSS2_TCTI_CONTEXT *tcti_ctx, size_t size, const uint8
     }
     TSS2_TCTI_SPI_CONTEXT* ctx = tcti_spi;
 
-    rc = tcti_common_transmit_checks (tcti_common, cmd_buf, TCTI_SPI_MAGIC);
+    rc = tcti_common_transmit_checks (tcti_common, cmd_buf, TCTI_SPI_USB_MAGIC);
     if (rc != TSS2_RC_SUCCESS) {
+LOG_ERROR("transmit checks failed");
         return rc;
     }
     rc = header_unmarshal (cmd_buf, &header);
@@ -524,21 +888,67 @@ TSS2_RC tcti_spi_set_locality (TSS2_TCTI_CONTEXT* tcti_context, uint8_t locality
     (void)(locality);
     return TSS2_TCTI_RC_NOT_IMPLEMENTED;
 }
+#endif
 
-TSS2_RC Tss2_Tcti_Spi_Init (TSS2_TCTI_CONTEXT* tcti_context, size_t* size, TSS2_TCTI_SPI_PLATFORM platform_conf)
+extern TSS2_RC tcti_spi_receive (TSS2_TCTI_CONTEXT* tcti_context, size_t *response_size, unsigned char *response_buffer, int32_t timeout);
+extern TSS2_RC tcti_spi_transmit (TSS2_TCTI_CONTEXT *tcti_ctx, size_t size, const uint8_t *cmd_buf);
+extern void tcti_spi_finalize (TSS2_TCTI_CONTEXT* tcti_context);
+TSS2_RC tcti_spi_cancel (TSS2_TCTI_CONTEXT* tcti_context)
 {
-    TSS2_RC rc;
+    (void)(tcti_context);
+    return TSS2_TCTI_RC_NOT_IMPLEMENTED;
+}
+
+TSS2_RC tcti_spi_get_poll_handles (TSS2_TCTI_CONTEXT* tcti_context, TSS2_TCTI_POLL_HANDLE *handles, size_t *num_handles)
+{
+    (void)(tcti_context);
+    (void)(handles);
+    (void)(num_handles);
+    return TSS2_TCTI_RC_NOT_IMPLEMENTED;
+}
+
+TSS2_RC tcti_spi_set_locality (TSS2_TCTI_CONTEXT* tcti_context, uint8_t locality)
+{
+    (void)(tcti_context);
+    (void)(locality);
+    return TSS2_TCTI_RC_NOT_IMPLEMENTED;
+}
+TSS2_TCTI_SPI_CONTEXT* tcti_spi_context_cast (TSS2_TCTI_CONTEXT *tcti_ctx)
+{
+    if (tcti_ctx != NULL && TSS2_TCTI_MAGIC (tcti_ctx) == TCTI_SPI_USB_MAGIC) {
+        return (TSS2_TCTI_SPI_CONTEXT*)tcti_ctx;
+    }
+LOG_ERROR("context cast failed");
+    return NULL;
+}
+
+/*
+ * This function down-casts the device TCTI context to the common context
+ * defined in the tcti-common module.
+ */
+TSS2_TCTI_COMMON_CONTEXT* tcti_spi_down_cast (TSS2_TCTI_SPI_CONTEXT *tcti_spi)
+{
+    if (tcti_spi == NULL) {
+        return NULL;
+    }
+    return &tcti_spi->common;
+}
+
+TSS2_RC Tss2_Tcti_Spi_Usb_Init (TSS2_TCTI_CONTEXT* tcti_context, size_t* size, const char* config)
+{
     TSS2_TCTI_SPI_CONTEXT* tcti_spi;
     TSS2_TCTI_COMMON_CONTEXT* tcti_common;
+    TSS2_TCTI_SPI_PLATFORM tcti_platform = {}; 
 
     // Check if context size is requested
     if (tcti_context == NULL) {
-        *size = sizeof (TSS2_TCTI_SPI_CONTEXT);
-        return TSS2_RC_SUCCESS;
+        return  Tss2_Tcti_Spi_Init(NULL, size, tcti_platform);
     }
 
+    tcti_platform = create_tcti_spi_platform();
+//LOG_ERROR("INIT");
     // Init TCTI context
-    TSS2_TCTI_MAGIC (tcti_context) = TCTI_SPI_MAGIC;
+    TSS2_TCTI_MAGIC (tcti_context) = TCTI_SPI_USB_MAGIC;
     TSS2_TCTI_VERSION (tcti_context) = TCTI_VERSION;
     TSS2_TCTI_TRANSMIT (tcti_context) = tcti_spi_transmit;
     TSS2_TCTI_RECEIVE (tcti_context) = tcti_spi_receive;
@@ -554,61 +964,16 @@ TSS2_RC Tss2_Tcti_Spi_Init (TSS2_TCTI_CONTEXT* tcti_context, size_t* size, TSS2_
     tcti_common->state = TCTI_STATE_TRANSMIT;
     memset (&tcti_common->header, 0, sizeof (tcti_common->header));
     tcti_common->locality = 0;
-    
-    // Copy platform struct into context
-    tcti_spi->platform = platform_conf;
+    (void) config;
 
-    // Probe TPM
-    TSS2_TCTI_SPI_CONTEXT* ctx = tcti_spi;
-    LOG_DEBUG("Probing TPM...");
-    uint32_t did_vid = 0;
-    for (int retries = 100; retries > 0; retries--) {
-        // In case of failed read div_vid is set to zero
-        spi_tpm_read_reg(ctx, TCTI_SPI_TPM_DID_VID_REG, &did_vid, sizeof(did_vid));
-        if (did_vid != 0) break;
-        // TPM might be resetting, let's retry in a bit
-        spi_tpm_delay_ms(ctx, 10);
-    }
-    if (did_vid == 0) {
-        LOG_ERROR("Probing TPM failed");
-        return TSS2_TCTI_RC_IO_ERROR;
-    }    
-    LOG_DEBUG("Probing TPM successful");
 
-    // Claim locality
-    LOG_DEBUG("Claiming TPM locality...");
-    rc = spi_tpm_claim_locality(ctx);
-    if (rc != TSS2_RC_SUCCESS) {
-        return TSS2_TCTI_RC_IO_ERROR;
-    }
-    
-    // Wait up to 200ms for TPM to become ready
-    LOG_DEBUG("Waiting for TPM to become ready...");
-    uint32_t expected_status_bits = TCTI_SPI_TPM_STS_COMMAND_READY;
-    rc = spi_tpm_wait_for_status(ctx, expected_status_bits, expected_status_bits, 200);
-    if (rc != TSS2_RC_SUCCESS) {
-        LOG_ERROR("Failed waiting for TPM to become ready");
-        return rc;
-    }
-    LOG_DEBUG("TPM is ready");
-
-    // Get rid
-    uint8_t rid = 0;
-    spi_tpm_read_reg(ctx, TCTI_SPI_TPM_RID_REG, &rid, sizeof(rid));
-    
-    // Print device details
-    uint16_t vendor_id, device_id, revision;
-    vendor_id = did_vid & 0xffff;
-    device_id = did_vid >> 16;
-    revision = rid;
-    LOG_INFO("Connected to TPM with vid:did:rid of %4.4x:%4.4x:%2.2x", vendor_id, device_id, revision);
-    
-    return TSS2_RC_SUCCESS;
+    // Initialize TCTI context
+    return Tss2_Tcti_Spi_Init(tcti_context, size, tcti_platform);
 }
 
 const TSS2_TCTI_INFO tss2_tcti_info = {
     .version = TCTI_VERSION,
-    .name = "tcti-spi",
+    .name = "tcti-spi-usb",
     .description = "Platform independent TCTI for communication with TPMs over SPI.",
     .config_help = "TSS2_TCTI_SPI_PLATFORM struct containing platform methods. See tss2_tcti_spi.h for more information.",
     
@@ -616,7 +981,7 @@ const TSS2_TCTI_INFO tss2_tcti_info = {
      * The Tss2_Tcti_Spi_Init method has a different signature than required by .init due too
      * our custom platform_conf parameter, so we can't expose it here and it has to be used directly.
      */
-    .init = NULL,
+    .init = Tss2_Tcti_Spi_Usb_Init
 };
 
 const TSS2_TCTI_INFO* Tss2_Tcti_Info (void)

@@ -319,6 +319,7 @@ tctildr_get_tcti(const char *name,
     }
     *tcti = NULL;
     if (name == NULL) {
+    LOG_ERROR("NAME is NULL");
         return tctildr_get_default (tcti, data);
     }
 

@@ -117,6 +117,7 @@ TESTS_UNIT  = \
     test/unit/tctildr-nodl \
     test/unit/tctildr-tcti \
     test/unit/tctildr-getinfo \
+    test/unit/tcti-spi-lt2go \
     test/unit/dlopen-fail \
     test/unit/dlopen-UINT8-marshal \
     test/unit/dlopen-TPM2B-marshal \
@@ -533,6 +534,20 @@ test_unit_tcti_spi_helper_CFLAGS  = $(CMOCKA_CFLAGS) $(TESTS_CFLAGS)
 test_unit_tcti_spi_helper_LDADD   = $(CMOCKA_LIBS) $(libtss2_tcti_spi_helper)
 test_unit_tcti_spi_helper_SOURCES = test/unit/tcti-spi-helper.c
 endif
+
+test_unit_tcti_spi_lt2go_CFLAGS  = $(CMOCKA_CFLAGS) $(TESTS_CFLAGS)
+test_unit_tcti_spi_lt2go_LDADD   = $(CMOCKA_LIBS) $(libtss2_tcti_spi_helper)
+test_unit_tcti_spi_lt2go_LDFLAGS = -Wl,--wrap=libusb_control_transfer \
+                                   -Wl,--wrap=libusb_bulk_transfer \
+                                   -Wl,--wrap=libusb_close \
+                                   -Wl,--wrap=libusb_exit \
+                                   -Wl,--wrap=libusb_init \
+                                   -Wl,--wrap=libusb_strerror \
+                                   -Wl,--wrap=libusb_open_device_with_vid_pid \
+                                   -Wl,--wrap=libusb_dev_mem_alloc \
+                                   -Wl,--wrap=libusb_dev_mem_free
+test_unit_tcti_spi_lt2go_SOURCES = test/unit/tcti-spi-lt2go.c \
+                                   src/tss2-tcti/tcti-spi-lt2go.c
 
 test_unit_tctildr_CFLAGS = $(CMOCKA_CFLAGS) $(TESTS_CFLAGS)
 test_unit_tctildr_LDADD = $(CMOCKA_LIBS) $(libutil)

@@ -169,12 +169,19 @@ platform_timeout_expired (void* user_data, bool *is_timeout_expired)
 void
 platform_finalize(void *user_data)
 {
+    int ret = 0;
     PLATFORM_USERDATA *platform_data = (PLATFORM_USERDATA *) user_data;
 
     if (platform_data->spi_dma_buffer)
         libusb_dev_mem_free (platform_data->dev_handle, platform_data->spi_dma_buffer, SPI_MAX_TRANSFER);
 
     if (platform_data->dev_handle) {
+        /* Release the interface we claimed. */
+        ret = libusb_release_interface(platform_data->dev_handle, 0);
+        if (ret) {
+            LOG_WARNING ("libusb_release_interface failed: %s.", libusb_strerror (ret));
+        }
+
         /* Close the device we opened */
         libusb_close (platform_data->dev_handle);
     }
@@ -212,6 +219,28 @@ create_tcti_spi_lt2go_platform (TSS2_TCTI_SPI_HELPER_PLATFORM *platform)
         goto out;
     }
 
+    ret = libusb_kernel_driver_active (platform_data->dev_handle, 0);
+    if (ret == 0 || ret == LIBUSB_ERROR_NOT_SUPPORTED) {
+        LOG_TRACE ("libusb_kernel_driver_active: kernel driver not attached or not supported by platform.")
+    }
+    else if (ret == 1) {
+        ret = libusb_detach_kernel_driver (platform_data->dev_handle, 0);
+        if (ret) {
+            LOG_ERROR ("libusb_detach_kernel_driver failed: %s.", libusb_strerror (ret));
+            goto out;
+        }
+    }
+    else {
+        LOG_ERROR ("libusb_kernel_driver_active failed: %s.", libusb_strerror (ret));
+        goto out;
+    }
+
+    ret = libusb_claim_interface (platform_data->dev_handle, 0);
+    if (ret) {
+        LOG_ERROR ("libusb_claim_interface failed: %s.", libusb_strerror (ret));
+        goto out;
+    }
+
     platform_data->spi_dma_buffer = libusb_dev_mem_alloc (platform_data->dev_handle, SPI_MAX_TRANSFER);
     if (!platform_data->spi_dma_buffer){
         LOG_ERROR ("libusb_dev_mem_alloc failed.");
@@ -235,6 +264,12 @@ out:
         libusb_dev_mem_free (platform_data->dev_handle, platform_data->spi_dma_buffer, SPI_MAX_TRANSFER);
 
     if (platform_data->dev_handle) {
+        /* Release the interface we claimed */
+        ret = libusb_release_interface(platform_data->dev_handle, 0);
+        if (ret) {
+            LOG_WARNING ("libusb_release_interface failed: %s.", libusb_strerror (ret));
+        }
+
         /* Close the device we opened */
         libusb_close (platform_data->dev_handle);
     }
